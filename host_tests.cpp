@@ -140,6 +140,13 @@ static void check_journals(const fs::path& root) {
     std::cout<<"PASS out-of-order journals, worker/micro changes, torn tails/headers, crash boundary, corruption, duplicates, parameter mismatch\n";
 }
 static void check_locks_and_parameters(const fs::path& root) {
+    require(bit_width_u64(0)==0,"zero bit width changed");
+    for(unsigned bit=0;bit<64;++bit) {
+        const uint64_t power=uint64_t{1}<<bit;
+        require(bit_width_u64(power)==bit+1,"power-of-two bit width changed");
+        require(bit_width_u64(power-1)==bit,"bit width below power of two changed");
+    }
+    require(bit_width_u64(std::numeric_limits<uint64_t>::max())==64,"maximum bit width changed");
     auto o=make_options(root,"locks");
     { RunLock lock(o.out); must_throw([&]{RunLock another(o.out);},"concurrent directory lock accepted"); }
     { RunLock lock(o.out); }

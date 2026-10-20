@@ -9,7 +9,6 @@
 #include <memory>
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -442,9 +441,16 @@ static Options parse(int argc,char** argv) {
                                  "PNUM 3..65534, ell-i <=61, 2^ell-i >=PNUM, input mode sequential|affine)");
     return o;
 }
+// C++17 equivalent of std::bit_width, including bit_width_u64(0) == 0.
+// Host-side parameter calculation only; GPU AES/PRP/insertion code is unchanged.
+static unsigned bit_width_u64(uint64_t value) noexcept {
+    unsigned bits=0;
+    for(;value!=0;value>>=1) ++bits;
+    return bits;
+}
 static float original_log2_u64(uint64_t n) {
     if(n==0) return -std::numeric_limits<float>::infinity();
-    const unsigned e=std::bit_width(n)-1;
+    const unsigned e=bit_width_u64(n)-1;
     const double x=(double)n/(double)(1ULL<<e);
     if(x>=2.0) return (float)(e+1);
     const double z=(x-1.0)/(x+1.0), z2=z*z;
@@ -475,7 +481,7 @@ static Params parameters(const Options& o) {
     if(x.buckets>std::numeric_limits<uint64_t>::max()/x.bucket_size)
         throw std::runtime_error("PRP domain overflow");
     x.domain=x.buckets*x.bucket_size;
-    uint32_t bits=std::max<uint32_t>((uint32_t)std::bit_width(x.domain-1),2u);
+    uint32_t bits=std::max<uint32_t>(bit_width_u64(x.domain-1),2u);
     if(bits&1u) ++bits;
     x.half_bits=bits/2;
     x.mask=(1ULL<<x.half_bits)-1ULL;

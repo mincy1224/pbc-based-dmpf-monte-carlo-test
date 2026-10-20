@@ -139,13 +139,17 @@ static void check_layout_selection() {
         return std::string(table_layout_name(o,parameters(o)));
     };
     Options o;
-    ensure(planned(o,4096,16)=="shared-trial","auto should pick shared-trial for m=4096");
-    ensure(planned(o,1024,16)=="shared-trial","auto should pick shared-trial for m=1024");
+    ensure(planned(o,4096,16)=="shared-map","auto should plan shared-map for m=4096");
+    ensure(planned(o,1024,16)=="shared-map","auto should plan shared-map for m=1024");
     ensure(planned(o,512,16)=="cached-global","auto should keep cached-global for m=512");
     ensure(planned(o,16,8)=="direct-global","auto should keep the per-thread direct path at m=16");
     ensure(planned(o,16,32)=="direct-global","large half_bits should disable the round cache");
     o.table_layout="global";
     ensure(planned(o,4096,16)=="cached-global","--table-layout global must not use shared");
+    o=Options{};o.shared_variant="round";
+    ensure(planned(o,4096,16)=="shared-trial","--shared-variant round must keep the round cache");
+    o=Options{};o.shared_variant="map";
+    ensure(planned(o,4096,16)=="shared-map","--shared-variant map must select the bucket map");
     o=Options{};o.table_layout="shared";o.prp_cache="off";
     bool threw=false;
     try { (void)planned(o,4096,16); } catch(const std::runtime_error&) { threw=true; }
@@ -154,6 +158,56 @@ static void check_layout_selection() {
     threw=false;
     try { (void)planned(o,4096,16); } catch(const std::runtime_error&) { threw=true; }
     ensure(threw,"shared layout with --global-table must be rejected");
+}
+// Host emulation of the precomputed-bucket-map layout.  The map is built for
+// every (ordinal, candidate) pair from the same per-trial round cache, then the
+// direct insert_core consumes it.  Checks the failure decision and every final
+// table slot against the direct AES-NI reference.
+static void emulate_shared_map_trials(Options o,unsigned first,unsigned count) {
+    const auto p=parameters(o);
+    ensure(shared_map_supported(o.pnum,p.half_bits,p.buckets),"shared map unexpectedly unsupported");
+    const unsigned width=1u<<p.half_bits,entries=8u<<p.half_bits;
+    const CpuAes batch(batch_key(o.seed,7));
+    std::vector<uint16_t> bins(p.buckets),map(size_t(o.pnum)*3),rounds(entries);
+    std::vector<uint32_t> reference_bins(p.buckets);
+    for(unsigned index=0;index<count;++index) {
+        const unsigned tid=first+index;
+        uint32_t words[4];
+        batch.words(0x4b455931u,0,tid,0x50525031u,words);
+        const CpuAes aes(cpu_key_from_words(words));
+        batch.words(0x57414c4bu,0,tid,0x524e4731u,words);
+        uint64_t walk=(uint64_t(words[0])<<32)|words[1];
+        const uint64_t range_mask=(uint64_t{1}<<o.ell_i)-1;
+        const uint64_t shift=((uint64_t(words[2])<<32)|words[3])&range_mask;
+        uint64_t input_state=shift^0xd1b54a32d192ed03ULL;
+        const uint64_t step=(cpu_splitmix(input_state)|1ULL)&range_mask;
+        const uint64_t randomness=cpu_splitmix(walk);
+        for(unsigned e=0;e<entries;++e)
+            rounds[e]=static_cast<uint16_t>(
+                aes.last_word(0x43455350u,e>>p.half_bits,p.half_bits,e&(width-1))&p.mask);
+        const CachedBucketsT<uint16_t> pre{rounds.data(),1,p.domain,p.bucket_size,
+            p.mask,range_mask,shift,step,p.half_bits,o.input_mode=="sequential"};
+        for(uint32_t ordinal=0;ordinal<o.pnum;++ordinal)
+            for(uint32_t which=0;which<3;++which)
+                map[size_t(ordinal)*3+which]=static_cast<uint16_t>(pre(ordinal,which));
+        std::fill(bins.begin(),bins.end(),SharedBins::empty());
+        const PrecomputedBuckets bucket{map.data()};
+        const SharedBins table{bins.data(),1};
+        const bool actual=o.mode=="bgh25"?
+            insert_core<true>(o.pnum,p.kick,table,bucket,walk,randomness):
+            insert_core<false>(o.pnum,p.kick,table,bucket,walk,randomness);
+        const bool expected=cpu_trial(o,p,batch,tid,reference_bins);
+        ensure(actual==expected,"shared-map outcome differs from direct CPU AES-NI");
+        for(unsigned i=0;i<p.buckets;++i) {
+            if(reference_bins[i]==0xffffffffu) {
+                ensure(bins[i]==SharedBins::empty(),"shared-map empty slot mismatch");
+            } else {
+                ensure(SharedBins::ordinal(bins[i])==(reference_bins[i]&65535u) &&
+                       SharedBins::choice(bins[i])==((reference_bins[i]>>16)&3u),
+                       "shared-map table differs from direct CPU AES-NI");
+            }
+        }
+    }
 }
 int main() {
     if(!cpu_has_aesni()) return 77;
@@ -168,12 +222,15 @@ int main() {
                 Options o;o.mode=mode;o.input_mode=input;o.pnum=16;o.ell_i=8;
                 emulate_cached_trials(o,table,65);
                 emulate_shared_trials(o,0,65);
+                emulate_shared_map_trials(o,0,9);
                 emulate_shared_trials(o,7,5);
                 o.pnum=4096;o.ell_i=16;emulate_cached_trials(o,table,2);
                 emulate_shared_trials(o,0,5);
+                emulate_shared_map_trials(o,0,3);
                 // Largest supported 16-bit table: ordinal 15999 uses all 14
                 // ordinal bits while choice still fits in bits 14-15.
                 o.pnum=16000;o.ell_i=14;emulate_shared_trials(o,3,2);
+                emulate_shared_map_trials(o,3,1);
             }
         std::cout<<"PASS replicated AES/key expansion, cached PRP positions, strided/tail layout, "
                    "shared-trial layout and exact insertion tables (host emulation)\n";

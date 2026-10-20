@@ -72,11 +72,15 @@ def command(args, mode, directory, workers, micro, global_table=False):
               '--seed', str(args.seed), '--input-mode', args.input_mode,
               '--workers', str(workers), '--micro', str(micro),
               '--prp-cache', args.prp_cache, '--table-layout', args.table_layout,
+              '--shared-variant', args.shared_variant,
               '--stop-after', str(TOTAL), '--out', str(directory)]
     if args.warps_per_block:
         result += ['--warps-per-block', str(args.warps_per_block)]
     if global_table:
-        result.append('--global-table')
+        # This case deliberately exercises the global table.  A shared-layout
+        # request conflicts with --global-table, so override it here; the last
+        # --table-layout wins in the executable's parser.
+        result += ['--table-layout', 'global', '--global-table']
     return result
 
 
@@ -184,6 +188,8 @@ def main():
                         help='Use on to exercise the new cached GPU architecture even at small m')
     parser.add_argument('--table-layout', choices=['auto', 'global', 'shared'], default='auto',
                         help='Use shared to exercise the warp-private shared-memory layout at small m')
+    parser.add_argument('--shared-variant', choices=['auto', 'round', 'map'], default='auto',
+                        help='Warp-private variant: round cache, precomputed bucket map, or auto')
     parser.add_argument('--warps-per-block', type=int, default=0,
                         help='Trials per block for --table-layout shared; 0=auto')
     args = parser.parse_args()
@@ -203,6 +209,7 @@ def main():
                   require_failures=args.require_failures, modes={})
     report['prp_cache'] = args.prp_cache
     report['table_layout'] = args.table_layout
+    report['shared_variant'] = args.shared_variant
     report['warps_per_block'] = args.warps_per_block
     write_json(args.out / 'report.json', report)
     try:

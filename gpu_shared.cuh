@@ -20,8 +20,9 @@ CUCKOO_HD inline bool shared_trial_index(uint32_t block,uint32_t warp,uint32_t w
 
 #ifndef CUCKOO_HOST_TEST
 // Dynamic shared layout: [1024 T-table words][256 S-box bytes][warp state...].
-// Each warp state is [uint16 bins][uint16 round cache].
-template<bool BGH>
+// Warp state is [uint16 bins][uint16 round cache] for MAP=false, or
+// [uint16 bins][3*pnum uint16 bucket map][uint16 round cache] for MAP=true.
+template<bool BGH,bool MAP>
 __global__ void cuckoo_shared(uint32_t count,uint32_t first,uint32_t pnum,uint32_t buckets,
         uint32_t kick,uint64_t width,uint64_t domain,uint32_t half,uint64_t mask,
         uint64_t range_mask,uint32_t input_mode,AesKey batch_key,uint32_t warps,
@@ -38,9 +39,16 @@ __global__ void cuckoo_shared(uint32_t count,uint32_t first,uint32_t pnum,uint32
     uint32_t trial=0;
     if(warp>=warps || !shared_trial_index(blockIdx.x,warp,warps,count,first,trial)) return;
 
-    uint8_t* state=smem+4352+uint64_t(warp)*shared_warp_bytes(buckets,half);
+    const uint64_t per_warp=MAP?shared_map_warp_bytes(buckets,half,pnum)
+                               :shared_warp_bytes(buckets,half);
+    uint8_t* state=smem+4352+uint64_t(warp)*per_warp;
     uint16_t* bins=reinterpret_cast<uint16_t*>(state);
-    uint16_t* rounds=reinterpret_cast<uint16_t*>(state+shared_bins_bytes(buckets));
+    uint16_t* map=nullptr;
+    uint16_t* rounds=bins+buckets;
+    if constexpr(MAP) {
+        map=bins+buckets;
+        rounds=map+3u*pnum;
+    }
     const uint16_t empty=SharedBins::empty();
     for(uint32_t k=lane;k<buckets;k+=32) bins[k]=empty;
     __syncwarp();
@@ -68,12 +76,32 @@ __global__ void cuckoo_shared(uint32_t count,uint32_t first,uint32_t pnum,uint32
     }
     __syncwarp();
 
+    if constexpr(MAP) {
+        // Precompute all three candidate buckets per ordinal while the whole
+        // warp is still active.  The serial insertion then becomes one map
+        // lookup plus one bin lookup per probe.
+        const CachedBucketsT<uint16_t> pre{rounds,1,domain,width,mask,range_mask,
+                                           shift,step,half,input_mode==0};
+        for(uint32_t o=lane;o<pnum;o+=32) {
+            map[size_t(o)*3+0]=static_cast<uint16_t>(pre(o,0));
+            map[size_t(o)*3+1]=static_cast<uint16_t>(pre(o,1));
+            map[size_t(o)*3+2]=static_cast<uint16_t>(pre(o,2));
+        }
+        __syncwarp();
+    }
+
     if(lane==0) {
-        const CachedBucketsT<uint16_t> bucket{rounds,1,domain,width,mask,range_mask,
-                                              shift,step,half,input_mode==0};
         const SharedBins table{bins,1};
-        if(insert_core<BGH>(pnum,kick,table,bucket,walk,randomness))
-            failed_offsets[atomicAdd(failed_count,1u)]=trial;
+        bool failed;
+        if constexpr(MAP) {
+            const PrecomputedBuckets bucket{map};
+            failed=insert_core<BGH>(pnum,kick,table,bucket,walk,randomness);
+        } else {
+            const CachedBucketsT<uint16_t> bucket{rounds,1,domain,width,mask,range_mask,
+                                                  shift,step,half,input_mode==0};
+            failed=insert_core<BGH>(pnum,kick,table,bucket,walk,randomness);
+        }
+        if(failed) failed_offsets[atomicAdd(failed_count,1u)]=trial;
     }
 }
 #endif

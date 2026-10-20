@@ -26,13 +26,28 @@ memory:
 * a block hosts as many independent experiments as fit, typically 4 warps on a
   99 KiB consumer GPU and 7-8 on an A100/H100.
 
+Inside the shared layout there are two variants:
+
+* `round` (`--shared-variant round`): bins plus the 8*2^half round cache.
+  Each probe walks the eight Feistel rounds as eight dependent shared lookups.
+  At `m=4096`, `ell_i=16` this is about 20 KiB per warp, so four experiments
+  fit per 99 KiB SM.
+* `map` (`--shared-variant map`): the warp first precomputes all three
+  candidate buckets for every ordinal into a 3*PNUM uint16 map (24 KiB at
+  `m=4096`), using the same round cache.  Insertion then needs one map lookup
+  plus one bin lookup per probe instead of eight dependent lookups.  The cost
+  is 44 KiB per warp, so only two experiments fit per 99 KiB SM, but the much
+  shorter serial chain should dominate.  `auto` prefers `map` whenever at least
+  two experiments fit and falls back to `round` otherwise.
+
 This does not change the experiment: same per-trial key, walk, candidate
-choices, eviction rules and failure condition.  It requires `PNUM < 16384`,
-`half_bits <= 12` and the round cache.  `auto` (default) uses it for
-`PNUM >= 1024` when it fits and keeps the original per-thread mapping for small
-tables; `--table-layout global` restores the old path.  The server log now
-prints `table=shared-trial|cached-global|global`, `warps`, `shared_bytes`,
-register/local usage and `active_blocks/SM`.
+choices, eviction rules and failure condition.  Both variants require
+`PNUM < 16384` and `half_bits <= 12`; the map also needs `BUCKETS_NUM <= 65535`.
+`auto` (default) uses the shared layout for `PNUM >= 1024` when it fits and
+keeps the original per-thread mapping for small tables; `--table-layout global`
+restores the old path.  The server log now prints
+`table=shared-trial|shared-map|cached-global|global`, `warps`, `shared_bytes`,
+`scratch_bytes`, register/local usage and `active_blocks/SM`.
 
 This is a bandwidth/latency argument, not a claim of a measured speedup.  Run
 the comparison below on the target GPU before choosing a production setting.
@@ -54,8 +69,16 @@ python3 compare_cpu_gpu.py --out compare_E20_01
 ```
 
 Defaults are `ET=20` (1,048,576 trials), `BT=20`, `m=4096`, `ell_i=16`,
-`seed=123`, both modes, GPU micro 65536, and CPU workers 1 and 4.  Useful
-variants:
+`seed=123`, both modes, GPU micro 65536, CPU workers 1 and 4, and both
+warp-private variants (`round` and `map`).  Useful variants:
+
+```bash
+# Measure the round-cache and bucket-map variants side by side (the default)
+python3 compare_cpu_gpu.py --shared-variants round map --out compare_variants_01
+
+# Measure only the precomputed-bucket-map layout
+python3 compare_cpu_gpu.py --shared-variants map --out compare_map_01
+```
 
 ```bash
 # One mode only, three repeats of every GPU case

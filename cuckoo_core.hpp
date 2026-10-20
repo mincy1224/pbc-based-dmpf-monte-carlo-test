@@ -72,6 +72,16 @@ struct CachedBucketsT {
 };
 using CachedBuckets = CachedBucketsT<uint16_t>;
 
+// Precomputed bucket positions for every (ordinal, candidate) pair.  The map
+// build is parallel across all lanes; the sequential insertion then needs one
+// shared lookup per probe instead of the eight dependent Feistel lookups.
+struct PrecomputedBuckets {
+    const uint16_t* values;
+    CUCKOO_CORE uint32_t operator()(uint32_t ordinal,uint32_t which) const {
+        return uint32_t(values[size_t(ordinal)*3+which]);
+    }
+};
+
 // Warp-private shared-memory layout: one experiment per warp.  The 16-bit table
 // needs 14 ordinal bits, so pnum<16384; the round cache has 8*2^half entries.
 CUCKOO_HD inline bool shared_layout_supported(uint32_t pnum,uint32_t half_bits) {
@@ -85,6 +95,16 @@ CUCKOO_HD inline uint64_t shared_rounds_bytes(uint32_t half_bits) {
 }
 CUCKOO_HD inline uint64_t shared_warp_bytes(uint32_t buckets,uint32_t half_bits) {
     return shared_bins_bytes(buckets)+shared_rounds_bytes(half_bits);
+}
+CUCKOO_HD inline bool shared_map_supported(uint32_t pnum,uint32_t half_bits,uint32_t buckets) {
+    return shared_layout_supported(pnum,half_bits) && buckets<=0xffffu;
+}
+CUCKOO_HD inline uint64_t shared_map_bytes(uint32_t pnum) {
+    return uint64_t(pnum)*3*sizeof(uint16_t);
+}
+// Map variant: bins + 3*pnum bucket values + the round cache used to build it.
+CUCKOO_HD inline uint64_t shared_map_warp_bytes(uint32_t buckets,uint32_t half_bits,uint32_t pnum) {
+    return shared_bins_bytes(buckets)+shared_map_bytes(pnum)+shared_rounds_bytes(half_bits);
 }
 
 CUCKOO_CORE uint64_t core_splitmix(uint64_t& state) {

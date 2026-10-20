@@ -413,6 +413,7 @@ struct Options {
     uint32_t warps_per_block=0; // 0 = choose the largest warp-private layout that fits
     std::string prp_cache="auto";
     std::string table_layout="auto"; // auto|global|shared
+    std::string shared_variant="auto"; // auto|round|map
     std::string backend="cuda";
     bool force_global=false, status_only=false;
 };
@@ -436,8 +437,8 @@ static Options parse(int argc,char** argv) {
                 "--pnum 16 --seed 123 --workers 1 --micro 131072 "
                 "--out results [--input-mode sequential|affine] "
                 "[--scratch-mib 256] [--prp-cache auto|on|off] [--block-threads 256] "
-                "[--table-layout auto|global|shared] [--warps-per-block N] "
-                "[--stop-after 1048576] [--global-table] [--status]\n";
+                "[--table-layout auto|global|shared] [--shared-variant auto|round|map] "
+                "[--warps-per-block N] [--stop-after 1048576] [--global-table] [--status]\n";
             std::exit(0);
         }
         if(a=="--global-table") { o.force_global=true; continue; }
@@ -453,6 +454,7 @@ static Options parse(int argc,char** argv) {
         else if(a=="--prp-cache") o.prp_cache=v;
         else if(a=="--block-threads") o.block_threads=parse_u32(v);
         else if(a=="--table-layout") o.table_layout=v;
+        else if(a=="--shared-variant") o.shared_variant=v;
         else if(a=="--warps-per-block") o.warps_per_block=parse_u32(v);
         else if(a=="--seed") o.seed=parse_u64(v);
         else if(a=="--workers") { auto n=parse_u64(v); if(n>256) throw std::runtime_error("workers exceeds 256"); o.workers=static_cast<int>(n); }
@@ -467,6 +469,7 @@ static Options parse(int argc,char** argv) {
         (o.block_threads!=64 && o.block_threads!=128 && o.block_threads!=256) ||
         (o.prp_cache!="auto" && o.prp_cache!="on" && o.prp_cache!="off") ||
         (o.table_layout!="auto" && o.table_layout!="global" && o.table_layout!="shared") ||
+        (o.shared_variant!="auto" && o.shared_variant!="round" && o.shared_variant!="map") ||
         o.warps_per_block>32 ||
         (o.ell_i<16 && (1ULL<<o.ell_i)<o.pnum) ||
         (o.mode!="bgh25" && o.mode!="drrt18") ||
@@ -548,9 +551,13 @@ static bool round_cache_enabled(const Options& o,const Params& p) {
     }
     return o.prp_cache=="on" || o.pnum>=512;
 }
+static bool shared_map_planned(const Options& o,const Params& p) {
+    if(!shared_map_supported(o.pnum,p.half_bits,p.buckets)) return false;
+    return o.shared_variant=="map" || (o.shared_variant=="auto" && o.pnum>=1024);
+}
 static const char* table_layout_name(const Options& o,const Params& p) {
     if(o.backend=="cpu-aesni") return round_cache_enabled(o,p)?"cpu-cached":"cpu-direct";
-    if(shared_trials_enabled(o,p)) return "shared-trial";
+    if(shared_trials_enabled(o,p)) return shared_map_planned(o,p)?"shared-map":"shared-trial";
     if(round_cache_enabled(o,p)) return "cached-global";
     return "direct-global";
 }
@@ -751,6 +758,7 @@ static void final_outputs(const Options& o,const Params& p,
            <<"  \"prp_cache_enabled\": "<<(round_cache_enabled(o,p)?"true":"false")<<",\n"
            <<"  \"table_layout_requested\": \""<<o.table_layout<<"\",\n"
            <<"  \"table_layout_planned\": \""<<table_layout_name(o,p)<<"\",\n"
+           <<"  \"shared_variant_requested\": \""<<o.shared_variant<<"\",\n"
            <<"  \"block_threads_requested\": "<<o.block_threads<<",\n"
            <<"  \"warps_per_block_requested\": "<<o.warps_per_block<<",\n"
            <<"  \"input_mode\": \""<<o.input_mode<<"\",\n"
@@ -811,30 +819,54 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
     // Shared-trial layout: one experiment per warp, so the per-trial table and
     // the round cache never touch global memory.  Capacity is per SM, not per
     // thread; micro is no longer capped by the scratch budget.
-    bool use_shared_trials=false;
+    enum class SharedKind { None, Round, Map };
+    SharedKind shared_kind=SharedKind::None;
     uint32_t shared_warps=0;
     uint64_t shared_bytes=0;
     if(shared_trials_enabled(o,p)) {
-        const uint64_t per_warp=shared_warp_bytes(p.buckets,p.half_bits);
-        const uint64_t max_warps=(uint64_t(prop.sharedMemPerBlockOptin)-4352)/per_warp;
-        uint32_t want=o.warps_per_block?o.warps_per_block:8;
-        if(want>max_warps) {
-            if(o.warps_per_block)
-                throw std::runtime_error("Requested warps per block do not fit in shared memory");
-            want=static_cast<uint32_t>(max_warps);
+        const bool map_possible=shared_map_supported(o.pnum,p.half_bits,p.buckets);
+        const uint64_t per_round=shared_warp_bytes(p.buckets,p.half_bits);
+        const uint64_t per_map=map_possible?shared_map_warp_bytes(p.buckets,p.half_bits,o.pnum):0;
+        auto max_warps=[&](uint64_t per)->uint32_t {
+            if(per==0) return 0;
+            const uint64_t fit=(uint64_t(prop.sharedMemPerBlockOptin)-4352)/per;
+            uint32_t w=o.warps_per_block?o.warps_per_block:8;
+            if(w>fit) {
+                if(o.warps_per_block)
+                    throw std::runtime_error("Requested warps per block do not fit in shared memory");
+                w=static_cast<uint32_t>(fit);
+            }
+            if(w>32) w=32;
+            return w;
+        };
+        const uint32_t round_warps=max_warps(per_round);
+        const uint32_t map_warps=max_warps(per_map);
+        bool choose_map=false;
+        if(o.shared_variant=="map") {
+            if(map_warps==0)
+                throw std::runtime_error("Shared bucket map is not supported or does not fit on this GPU");
+            choose_map=true;
+        } else if(o.shared_variant=="round") {
+            choose_map=false;
+        } else {
+            // The map removes eight dependent Feistel lookups per probe at the
+            // cost of 3*pnum extra shared bytes.  Prefer it whenever at least
+            // two experiments still fit per SM.
+            choose_map=map_possible && map_warps>=2;
         }
-        if(want>32) want=32;
+        uint32_t want=choose_map?map_warps:round_warps;
         // A single warp per SM leaves too little latency hiding; auto keeps the
         // global layout in that case, while an explicit request is honoured.
         if(o.table_layout=="auto" && want<2) want=0;
         if(want>0) {
-            use_shared_trials=true;
+            shared_kind=choose_map?SharedKind::Map:SharedKind::Round;
             shared_warps=want;
-            shared_bytes=4352+uint64_t(want)*per_warp;
+            shared_bytes=4352+uint64_t(want)*(choose_map?per_map:per_round);
         } else if(o.table_layout=="shared") {
             throw std::runtime_error("Shared table layout does not fit on this GPU");
         }
     }
+    const bool use_shared_trials=shared_kind!=SharedKind::None;
     bool cached=!use_shared_trials && round_cache_enabled(o,p);
     // If the shared layout did not fit, do not silently inflate the global
     // per-thread cache beyond the previously supported half_bits range.
@@ -848,9 +880,15 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
                           cached?32768:use_shared?shared_need:4352;
     if(sh_bytes>(size_t)prop.sharedMemPerBlock) {
         if(use_shared_trials && o.mode=="bgh25") {
-            CK(cudaFuncSetAttribute(cuckoo_shared<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+            if(shared_kind==SharedKind::Map)
+                CK(cudaFuncSetAttribute(cuckoo_shared<true,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+            else
+                CK(cudaFuncSetAttribute(cuckoo_shared<true,false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
         } else if(use_shared_trials) {
-            CK(cudaFuncSetAttribute(cuckoo_shared<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+            if(shared_kind==SharedKind::Map)
+                CK(cudaFuncSetAttribute(cuckoo_shared<false,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+            else
+                CK(cudaFuncSetAttribute(cuckoo_shared<false,false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
         } else if(cached && o.mode=="bgh25") {
             CK(cudaFuncSetAttribute(cuckoo_cached<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
         } else if(cached) {
@@ -882,13 +920,25 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
     std::unique_ptr<FILE,decltype(&fclose)> journal(open_journal(o,p,worker),fclose);
     cudaFuncAttributes attributes{}; int active_blocks=0;
     if(use_shared_trials && o.mode=="bgh25") {
-        CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<true>));
-        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<true>,
-                                                         shared_warps*32,sh_bytes));
+        if(shared_kind==SharedKind::Map) {
+            CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<true,true>));
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<true,true>,
+                                                             shared_warps*32,sh_bytes));
+        } else {
+            CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<true,false>));
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<true,false>,
+                                                             shared_warps*32,sh_bytes));
+        }
     } else if(use_shared_trials) {
-        CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<false>));
-        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<false>,
-                                                         shared_warps*32,sh_bytes));
+        if(shared_kind==SharedKind::Map) {
+            CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<false,true>));
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<false,true>,
+                                                             shared_warps*32,sh_bytes));
+        } else {
+            CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<false,false>));
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<false,false>,
+                                                             shared_warps*32,sh_bytes));
+        }
     } else if(cached && o.mode=="bgh25") {
         CK(cudaFuncGetAttributes(&attributes,cuckoo_cached<true>));
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_cached<true>,block_threads,sh_bytes));
@@ -908,7 +958,8 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
     {
         std::lock_guard<std::mutex> lock(print_mutex);
         std::cerr<<"Worker "<<worker<<" GPU "<<gpu<<" ("<<prop.name<<") bins="<<p.buckets
-                 <<" table="<<(use_shared_trials?"shared-trial":
+                 <<" table="<<(use_shared_trials?
+                               (shared_kind==SharedKind::Map?"shared-map":"shared-trial"):
                                cached?"cached-strided":use_shared?"shared":"global")
                  <<" micro="<<micro
                  <<" block="<<(use_shared_trials?shared_warps*32:block_threads)
@@ -933,14 +984,26 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
             const uint32_t input_mode=(o.input_mode=="sequential")?0u:1u;
             if(use_shared_trials && o.mode=="bgh25") {
                 const unsigned trial_blocks=(n+shared_warps-1)/shared_warps;
-                cuckoo_shared<true><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
-                    p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
-                    input_mode,key,shared_warps,d_count,d_offsets);
+                if(shared_kind==SharedKind::Map) {
+                    cuckoo_shared<true,true><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
+                        p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
+                        input_mode,key,shared_warps,d_count,d_offsets);
+                } else {
+                    cuckoo_shared<true,false><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
+                        p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
+                        input_mode,key,shared_warps,d_count,d_offsets);
+                }
             } else if(use_shared_trials) {
                 const unsigned trial_blocks=(n+shared_warps-1)/shared_warps;
-                cuckoo_shared<false><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
-                    p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
-                    input_mode,key,shared_warps,d_count,d_offsets);
+                if(shared_kind==SharedKind::Map) {
+                    cuckoo_shared<false,true><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
+                        p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
+                        input_mode,key,shared_warps,d_count,d_offsets);
+                } else {
+                    cuckoo_shared<false,false><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
+                        p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
+                        input_mode,key,shared_warps,d_count,d_offsets);
+                }
             } else if(cached && o.mode=="bgh25") {
                 cuckoo_cached<true><<<blocks,block_threads,sh_bytes>>>(n,offset,o.pnum,p.buckets,p.kick,
                     p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,input_mode,key,pitch,

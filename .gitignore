@@ -1,0 +1,8 @@
+build*/
+checkpoint_test_data/
+__pycache__/
+*.exe
+*.obj
+*.ilk
+*.pdb
+*.bin

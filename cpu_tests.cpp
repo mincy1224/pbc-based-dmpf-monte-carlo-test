@@ -8,11 +8,16 @@ static void check(bool condition,const char* message) {
 }
 static void check_reference(const char* mode,const std::vector<uint32_t>& expected) {
     Options o; o.mode=mode;o.seed=123;o.pnum=16;o.ell_i=8;o.et=15;o.bt=8;
-    const auto p=parameters(o); std::vector<uint32_t> bins(p.buckets),failed;
+    const auto p=parameters(o); std::vector<uint32_t> bins(p.buckets),cached_bins(p.buckets),failed;
+    std::vector<uint16_t> rounds(size_t{8}<<p.half_bits);
     for(uint32_t batch=0;batch<128;++batch) {
         const CpuAes aes(batch_key(o.seed,batch));
-        for(uint32_t offset=0;offset<256;++offset)
-            if(cpu_trial(o,p,aes,offset,bins)) failed.push_back(batch*256+offset);
+        for(uint32_t offset=0;offset<256;++offset) {
+            const bool direct=cpu_trial(o,p,aes,offset,bins);
+            const bool cached=cpu_trial_cached(o,p,aes,offset,cached_bins,rounds);
+            check(direct==cached && bins==cached_bins,"cached CPU differs from direct CPU outcome/table");
+            if(direct) failed.push_back(batch*256+offset);
+        }
     }
     check(failed==expected,"CPU AES-NI decisions differ from independent 32768-trial Python reference");
     std::cout<<"PASS "<<mode<<" all 32768 trials against Python reference; failed="<<failed.size()<<'\n';

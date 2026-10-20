@@ -12,3 +12,5 @@ __pycache__/
 /cuckoo_mem16.cu
 /tune_*/
 /cpu_E*/
+/compare_*/
+/smoke_*/

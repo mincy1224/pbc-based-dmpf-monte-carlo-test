@@ -71,7 +71,10 @@ def command(args, mode, directory, workers, micro, global_table=False):
               '--pnum', str(args.pnum), '--ell-i', str(args.ell_i),
               '--seed', str(args.seed), '--input-mode', args.input_mode,
               '--workers', str(workers), '--micro', str(micro),
+              '--prp-cache', args.prp_cache, '--table-layout', args.table_layout,
               '--stop-after', str(TOTAL), '--out', str(directory)]
+    if args.warps_per_block:
+        result += ['--warps-per-block', str(args.warps_per_block)]
     if global_table:
         result.append('--global-table')
     return result
@@ -177,10 +180,17 @@ def main():
                         help='Generate CPU reference results only; does not certify a GPU smoke test')
     parser.add_argument('--require-failures', action='store_true',
                         help='Also require observed failures in each mode (useful for small cases)')
+    parser.add_argument('--prp-cache', choices=['auto', 'on', 'off'], default='auto',
+                        help='Use on to exercise the new cached GPU architecture even at small m')
+    parser.add_argument('--table-layout', choices=['auto', 'global', 'shared'], default='auto',
+                        help='Use shared to exercise the warp-private shared-memory layout at small m')
+    parser.add_argument('--warps-per-block', type=int, default=0,
+                        help='Trials per block for --table-layout shared; 0=auto')
     args = parser.parse_args()
     require(3 <= args.pnum <= 65534 and 0 <= args.ell_i <= 61 and
             (1 << args.ell_i) >= args.pnum, 'Invalid pnum/ell-i')
     require(0 <= args.seed < (1 << 64) and args.timeout > 0, 'Invalid seed/timeout')
+    require(0 <= args.warps_per_block <= 32, 'Invalid warps per block')
     args.exe = args.exe.resolve()
     if not args.cpu_only:
         require(args.exe.is_file(), f'CUDA executable not found: {args.exe}')
@@ -191,6 +201,9 @@ def main():
                   pnum=args.pnum, ell_i=args.ell_i, seed=str(args.seed),
                   input_mode=args.input_mode, cpu_only=args.cpu_only,
                   require_failures=args.require_failures, modes={})
+    report['prp_cache'] = args.prp_cache
+    report['table_layout'] = args.table_layout
+    report['warps_per_block'] = args.warps_per_block
     write_json(args.out / 'report.json', report)
     try:
         failures = []

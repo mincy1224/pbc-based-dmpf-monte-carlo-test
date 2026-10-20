@@ -1,4 +1,5 @@
 #pragma once
+#include "cuckoo_core.hpp"
 #include <wmmintrin.h>
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -62,6 +63,7 @@ static uint32_t cpu_bucket(uint64_t element,uint32_t which,const CpuAes& aes,con
         }
         y=(left<<p.half_bits)|right;
     } while(y>=p.domain);
+    if(p.domain<=0xffffffffULL) return uint32_t(y)/uint32_t(p.bucket_size);
     return static_cast<uint32_t>(y/p.bucket_size);
 }
 static bool cpu_trial(const Options& o,const Params& p,const CpuAes& batch,
@@ -123,6 +125,28 @@ static bool cpu_trial(const Options& o,const Params& p,const CpuAes& batch,
     }
     return false;
 }
+static bool cpu_trial_cached(const Options& o,const Params& p,const CpuAes& batch,
+                             uint32_t offset,std::vector<uint32_t>& bins,std::vector<uint16_t>& rounds) {
+    uint32_t words[4];batch.words(0x4b455931u,0,offset,0x50525031u,words);
+    const CpuAes aes(cpu_key_from_words(words));
+    batch.words(0x57414c4bu,0,offset,0x524e4731u,words);
+    uint64_t walk=(uint64_t(words[0])<<32)|words[1];
+    const uint64_t range_mask=(uint64_t{1}<<o.ell_i)-1;
+    const uint64_t shift=((uint64_t(words[2])<<32)|words[3])&range_mask;
+    uint64_t input_state=shift^0xd1b54a32d192ed03ULL;
+    const uint64_t step=(cpu_splitmix(input_state)|1ULL)&range_mask;
+    const uint64_t randomness=cpu_splitmix(walk);
+    const unsigned width=1u<<p.half_bits;
+    for(unsigned r=0;r<8;++r)
+        for(unsigned right=0;right<width;++right)
+            rounds[r*width+right]=static_cast<uint16_t>(aes.last_word(0x43455350u,r,p.half_bits,right)&p.mask);
+    std::fill(bins.begin(),bins.end(),0xffffffffu);
+    const CachedBuckets bucket{rounds.data(),1,p.domain,p.bucket_size,p.mask,range_mask,shift,step,
+                               p.half_bits,o.input_mode=="sequential"};
+    const StridedBins table{bins.data(),1};
+    return o.mode=="bgh25"?insert_core<true>(o.pnum,p.kick,table,bucket,walk,randomness):
+                           insert_core<false>(o.pnum,p.kick,table,bucket,walk,randomness);
+}
 static void cpu_aes_self_test() {
     const CpuAes aes(expand_key(0x0706050403020100ULL,0x0f0e0d0c0b0a0908ULL));
     uint32_t words[4]; aes.words(0x00112233u,0x44556677u,0x8899aabbu,0xccddeeffu,words);
@@ -137,6 +161,7 @@ struct CpuBatchPaused {};
 static void cpu_batch_launch(const Options& o,const Params& p,const AesKey& key,
                              uint32_t count,Counters& s,std::vector<uint32_t>& failures) {
     const CpuAes batch(key);
+    const bool cached=round_cache_enabled(o,p);
     const uint32_t grain=std::min(o.micro,256u);
     std::atomic<uint32_t> next{0},finished{0};
     std::atomic<bool> abort{false};
@@ -146,12 +171,16 @@ static void cpu_batch_launch(const Options& o,const Params& p,const AesKey& key,
     auto worker=[&](int id) {
         try {
             std::vector<uint32_t> bins(p.buckets);
+            std::vector<uint16_t> rounds(cached?(size_t{8}<<p.half_bits):0);
             while(!abort.load() && !s.abort_inflight.load()) {
                 if(pause_requested(o)) break;
                 const auto first=next.fetch_add(grain);
                 if(first>=count) break;
                 const auto end=std::min(count,first+grain);
-                for(auto j=first;j<end;++j) if(cpu_trial(o,p,batch,j,bins)) results[id].push_back(j);
+                for(auto j=first;j<end;++j) {
+                    const bool failed=cached?cpu_trial_cached(o,p,batch,j,bins,rounds):cpu_trial(o,p,batch,j,bins);
+                    if(failed) results[id].push_back(j);
+                }
                 finished.fetch_add(end-first);
             }
         } catch(...) {errors[id]=std::current_exception();abort.store(true);}

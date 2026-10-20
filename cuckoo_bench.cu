@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #endif
 #include "checkpoint.hpp"
+#include "cuckoo_core.hpp"
 #include <memory>
 #include <algorithm>
 #include <atomic>
@@ -176,7 +177,10 @@ __device__ __forceinline__ uint32_t prp_bucket(
         }
         y=(left<<half_bits)|right;
     } while(y>=domain);
-    return (uint32_t)(y/bucket_size);
+    // 32-bit division is substantially cheaper on the GPU for the common
+    // ell_i<=30 domain; the quotient is < buckets either way.
+    return domain<=0xffffffffULL?uint32_t(uint32_t(y)/uint32_t(bucket_size))
+                               :uint32_t(y/bucket_size);
 }
 
 // Both supplied input modes yield PNUM distinct A[i] in [0,2^ELL_I).
@@ -312,6 +316,9 @@ __global__ void cuckoo_trials(uint32_t n,uint32_t first_offset,uint32_t pnum,
     }
 }
 
+#include "gpu_cached.cuh"
+#include "gpu_shared.cuh"
+
 __global__ void aes_kat(AesKey key, uint32_t* out) {
     extern __shared__ uint32_t sm[];
     uint32_t* te=sm;
@@ -334,6 +341,16 @@ static void aes_self_test() {
     const uint32_t correct[]={0x69c4e0d8,0x6a7b0430,0xd8cdb780,0x70b4c55a};
     if (std::memcmp(h,correct,sizeof(correct))!=0)
         throw std::runtime_error("AES-128 FIPS known-answer test FAILED");
+}
+static void cached_aes_self_test() {
+    const auto key=expand_key(0x0706050403020100ULL,0x0f0e0d0c0b0a0908ULL);
+    uint32_t host[32*4],*device=nullptr;CK(cudaMalloc((void**)&device,sizeof(host)));
+    cached_aes_kat<<<1,32,32768>>>(key,device);CK(cudaGetLastError());
+    CK(cudaMemcpy(host,device,sizeof(host),cudaMemcpyDeviceToHost));CK(cudaFree(device));
+    const uint32_t expected[]={0x69c4e0d8u,0x6a7b0430u,0xd8cdb780u,0x70b4c55au};
+    for(unsigned lane=0;lane<32;++lane)
+        if(std::memcmp(host+lane*4,expected,sizeof(expected)))
+            throw std::runtime_error("Replicated-table GPU AES/key expansion NIST test failed");
 }
 
 #endif // CUCKOO_HOST_TEST
@@ -392,6 +409,10 @@ struct Options {
     std::string mode="drrt18", out="cuckoo_results", input_mode="sequential";
     int workers=0;
     uint32_t scratch_mib=256;
+    uint32_t block_threads=256;
+    uint32_t warps_per_block=0; // 0 = choose the largest warp-private layout that fits
+    std::string prp_cache="auto";
+    std::string table_layout="auto"; // auto|global|shared
     std::string backend="cuda";
     bool force_global=false, status_only=false;
 };
@@ -414,7 +435,9 @@ static Options parse(int argc,char** argv) {
             std::cout<<"Usage: ./cuckoo_bench --mode bgh25|drrt18 --et 40 --bt 20 "
                 "--pnum 16 --seed 123 --workers 1 --micro 131072 "
                 "--out results [--input-mode sequential|affine] "
-                "[--scratch-mib 256] [--stop-after 1048576] [--global-table] [--status]\n";
+                "[--scratch-mib 256] [--prp-cache auto|on|off] [--block-threads 256] "
+                "[--table-layout auto|global|shared] [--warps-per-block N] "
+                "[--stop-after 1048576] [--global-table] [--status]\n";
             std::exit(0);
         }
         if(a=="--global-table") { o.force_global=true; continue; }
@@ -427,6 +450,10 @@ static Options parse(int argc,char** argv) {
         else if(a=="--ell-i") o.ell_i=parse_u32(v);
         else if(a=="--micro") o.micro=parse_u32(v);
         else if(a=="--scratch-mib") o.scratch_mib=parse_u32(v);
+        else if(a=="--prp-cache") o.prp_cache=v;
+        else if(a=="--block-threads") o.block_threads=parse_u32(v);
+        else if(a=="--table-layout") o.table_layout=v;
+        else if(a=="--warps-per-block") o.warps_per_block=parse_u32(v);
         else if(a=="--seed") o.seed=parse_u64(v);
         else if(a=="--workers") { auto n=parse_u64(v); if(n>256) throw std::runtime_error("workers exceeds 256"); o.workers=static_cast<int>(n); }
         else if(a=="--stop-after") o.stop_after=parse_u64(v);
@@ -437,6 +464,10 @@ static Options parse(int argc,char** argv) {
     }
     if (o.et>40 || o.bt>30 || o.bt>o.et || o.et==0 || o.bt==0 ||
         o.pnum<3 || o.pnum>65534 || o.micro==0 || o.scratch_mib==0 || o.ell_i>61 ||
+        (o.block_threads!=64 && o.block_threads!=128 && o.block_threads!=256) ||
+        (o.prp_cache!="auto" && o.prp_cache!="on" && o.prp_cache!="off") ||
+        (o.table_layout!="auto" && o.table_layout!="global" && o.table_layout!="shared") ||
+        o.warps_per_block>32 ||
         (o.ell_i<16 && (1ULL<<o.ell_i)<o.pnum) ||
         (o.mode!="bgh25" && o.mode!="drrt18") ||
         (o.input_mode!="sequential" && o.input_mode!="affine"))
@@ -489,6 +520,39 @@ static Params parameters(const Options& o) {
     x.half_bits=bits/2;
     x.mask=(1ULL<<x.half_bits)-1ULL;
     return x;
+}
+// One experiment per warp, table and round cache in shared memory.  Auto uses
+// it only where the old per-thread table would be large enough that random
+// global bucket loads dominate; small tables keep the much wider per-thread
+// mapping (32 trials per warp).
+static bool shared_trials_enabled(const Options& o,const Params& p) {
+    if(o.table_layout=="shared" && o.prp_cache=="off")
+        throw std::runtime_error("Shared table layout uses the PRP round cache; drop --prp-cache off");
+    if(o.table_layout=="shared" && o.force_global)
+        throw std::runtime_error("--table-layout shared conflicts with --global-table");
+    if(o.prp_cache=="off" || o.table_layout=="global" || o.force_global) return false;
+    if(!shared_layout_supported(o.pnum,p.half_bits)) {
+        if(o.table_layout=="shared")
+            throw std::runtime_error("Shared table layout needs PNUM < 16384 and half_bits <= 12");
+        return false;
+    }
+    if(o.table_layout=="shared") return true;
+    return o.pnum>=1024;
+}
+static bool round_cache_enabled(const Options& o,const Params& p) {
+    if(o.prp_cache=="off") return false;
+    if(shared_trials_enabled(o,p)) return true; // the shared kernel always caches
+    if(p.half_bits>10) {
+        if(o.prp_cache=="on") throw std::runtime_error("PRP round cache requires half_bits <=10; use auto/off");
+        return false;
+    }
+    return o.prp_cache=="on" || o.pnum>=512;
+}
+static const char* table_layout_name(const Options& o,const Params& p) {
+    if(o.backend=="cpu-aesni") return round_cache_enabled(o,p)?"cpu-cached":"cpu-direct";
+    if(shared_trials_enabled(o,p)) return "shared-trial";
+    if(round_cache_enabled(o,p)) return "cached-global";
+    return "direct-global";
 }
 
 // Journal is append-only; every complete batch consists of a header, offsets and
@@ -683,6 +747,12 @@ static void final_outputs(const Options& o,const Params& p,
            <<"  \"mode\": \""<<o.mode<<"\",\n  \"algorithm\": \"prp-cuckoo-aes-feistel-port\",\n"
            <<"  \"backend\": \""<<o.backend<<"\",\n  \"workers\": "<<o.workers<<",\n"
            <<"  \"micro_requested\": "<<o.micro<<",\n  \"scratch_mib\": "<<o.scratch_mib<<",\n"
+           <<"  \"prp_cache_requested\": \""<<o.prp_cache<<"\",\n"
+           <<"  \"prp_cache_enabled\": "<<(round_cache_enabled(o,p)?"true":"false")<<",\n"
+           <<"  \"table_layout_requested\": \""<<o.table_layout<<"\",\n"
+           <<"  \"table_layout_planned\": \""<<table_layout_name(o,p)<<"\",\n"
+           <<"  \"block_threads_requested\": "<<o.block_threads<<",\n"
+           <<"  \"warps_per_block_requested\": "<<o.warps_per_block<<",\n"
            <<"  \"input_mode\": \""<<o.input_mode<<"\",\n"
            <<"  \"seed\": "<<o.seed<<",\n  \"ET\": "<<o.et<<",\n  \"BT\": "<<o.bt<<",\n"
            <<"  \"seed_decimal\": \""<<o.seed<<"\",\n  \"batch_size\": "<<(1ULL<<o.bt)<<",\n"
@@ -738,12 +808,54 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
     const uint64_t batch_size=1ULL<<o.bt;
     const uint64_t total_batches=1ULL<<(o.et-o.bt);
     cudaDeviceProp prop{}; CK(cudaGetDeviceProperties(&prop,gpu));
+    // Shared-trial layout: one experiment per warp, so the per-trial table and
+    // the round cache never touch global memory.  Capacity is per SM, not per
+    // thread; micro is no longer capped by the scratch budget.
+    bool use_shared_trials=false;
+    uint32_t shared_warps=0;
+    uint64_t shared_bytes=0;
+    if(shared_trials_enabled(o,p)) {
+        const uint64_t per_warp=shared_warp_bytes(p.buckets,p.half_bits);
+        const uint64_t max_warps=(uint64_t(prop.sharedMemPerBlockOptin)-4352)/per_warp;
+        uint32_t want=o.warps_per_block?o.warps_per_block:8;
+        if(want>max_warps) {
+            if(o.warps_per_block)
+                throw std::runtime_error("Requested warps per block do not fit in shared memory");
+            want=static_cast<uint32_t>(max_warps);
+        }
+        if(want>32) want=32;
+        // A single warp per SM leaves too little latency hiding; auto keeps the
+        // global layout in that case, while an explicit request is honoured.
+        if(o.table_layout=="auto" && want<2) want=0;
+        if(want>0) {
+            use_shared_trials=true;
+            shared_warps=want;
+            shared_bytes=4352+uint64_t(want)*per_warp;
+        } else if(o.table_layout=="shared") {
+            throw std::runtime_error("Shared table layout does not fit on this GPU");
+        }
+    }
+    bool cached=!use_shared_trials && round_cache_enabled(o,p);
+    // If the shared layout did not fit, do not silently inflate the global
+    // per-thread cache beyond the previously supported half_bits range.
+    if(!use_shared_trials && cached && p.half_bits>10 && o.prp_cache!="on") cached=false;
+    const uint32_t block_threads=cached?o.block_threads:THREADS;
+    const uint64_t cache_entries=cached?(uint64_t{8}<<p.half_bits):0;
     const uint64_t shared_need=4352ULL+uint64_t(THREADS)*p.buckets*sizeof(uint32_t);
-    const bool use_shared=!o.force_global && shared_need<=
+    const bool use_shared=!cached && !use_shared_trials && !o.force_global && shared_need<=
         (uint64_t)prop.sharedMemPerBlockOptin;
-    const size_t sh_bytes=use_shared?shared_need:4352;
+    const size_t sh_bytes=use_shared_trials?shared_bytes:
+                          cached?32768:use_shared?shared_need:4352;
     if(sh_bytes>(size_t)prop.sharedMemPerBlock) {
-        if(o.mode=="bgh25") {
+        if(use_shared_trials && o.mode=="bgh25") {
+            CK(cudaFuncSetAttribute(cuckoo_shared<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+        } else if(use_shared_trials) {
+            CK(cudaFuncSetAttribute(cuckoo_shared<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+        } else if(cached && o.mode=="bgh25") {
+            CK(cudaFuncSetAttribute(cuckoo_cached<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+        } else if(cached) {
+            CK(cudaFuncSetAttribute(cuckoo_cached<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
+        } else if(o.mode=="bgh25") {
             CK(cudaFuncSetAttribute(cuckoo_trials<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
         } else {
             CK(cudaFuncSetAttribute(cuckoo_trials<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
@@ -752,20 +864,61 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
     // Table-space budget per worker, independent of experiment seeds/journals.
     const uint64_t limit_bytes=uint64_t(o.scratch_mib)<<20;
     uint64_t micro=o.micro;
-    if(!use_shared) micro=std::min(micro,limit_bytes/(p.buckets*sizeof(uint32_t)));
+    const uint64_t bytes_per_trial=uint64_t(p.buckets)*sizeof(uint32_t)+cache_entries*sizeof(uint16_t);
+    if(use_shared_trials) { /* on-chip tables: no scratch cap */ }
+    else if(cached) micro=std::min(micro,(limit_bytes/bytes_per_trial/32)*32);
+    else if(!use_shared) micro=std::min(micro,limit_bytes/bytes_per_trial);
     micro=std::min(micro,batch_size);
     if(micro==0) throw std::runtime_error("Insufficient scratch memory or too many bins");
-    DeviceAllocation bins_memory(use_shared?0:micro*p.buckets*sizeof(uint32_t));
+    const size_t pitch=cached?((micro+31)/32)*32:micro;
+    DeviceAllocation bins_memory(use_shared||use_shared_trials?0:pitch*p.buckets*sizeof(uint32_t));
+    DeviceAllocation rounds_memory(cached?pitch*cache_entries*sizeof(uint16_t):0);
     DeviceAllocation count_memory(sizeof(uint32_t)), offsets_memory(micro*sizeof(uint32_t));
     auto* d_bins=bins_memory.get();
     auto* d_count=count_memory.get();
     auto* d_offsets=offsets_memory.get();
+    auto* d_rounds=reinterpret_cast<uint16_t*>(rounds_memory.get());
     std::vector<uint32_t> chunk_failures(micro);
     std::unique_ptr<FILE,decltype(&fclose)> journal(open_journal(o,p,worker),fclose);
+    cudaFuncAttributes attributes{}; int active_blocks=0;
+    if(use_shared_trials && o.mode=="bgh25") {
+        CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<true>));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<true>,
+                                                         shared_warps*32,sh_bytes));
+    } else if(use_shared_trials) {
+        CK(cudaFuncGetAttributes(&attributes,cuckoo_shared<false>));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_shared<false>,
+                                                         shared_warps*32,sh_bytes));
+    } else if(cached && o.mode=="bgh25") {
+        CK(cudaFuncGetAttributes(&attributes,cuckoo_cached<true>));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_cached<true>,block_threads,sh_bytes));
+    } else if(cached) {
+        CK(cudaFuncGetAttributes(&attributes,cuckoo_cached<false>));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_cached<false>,block_threads,sh_bytes));
+    } else if(o.mode=="bgh25") {
+        CK(cudaFuncGetAttributes(&attributes,cuckoo_trials<true>));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_trials<true>,block_threads,sh_bytes));
+    } else {
+        CK(cudaFuncGetAttributes(&attributes,cuckoo_trials<false>));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks,cuckoo_trials<false>,block_threads,sh_bytes));
+    }
+    const uint64_t scratch_bytes=
+        (use_shared||use_shared_trials?0:uint64_t(pitch)*p.buckets*sizeof(uint32_t))+
+        (cached?uint64_t(pitch)*cache_entries*sizeof(uint16_t):0);
     {
         std::lock_guard<std::mutex> lock(print_mutex);
         std::cerr<<"Worker "<<worker<<" GPU "<<gpu<<" ("<<prop.name<<") bins="<<p.buckets
-                 <<" table="<<(use_shared?"shared":"global")<<" micro="<<micro<<"\n";
+                 <<" table="<<(use_shared_trials?"shared-trial":
+                               cached?"cached-strided":use_shared?"shared":"global")
+                 <<" micro="<<micro
+                 <<" block="<<(use_shared_trials?shared_warps*32:block_threads)
+                 <<" warps="<<(use_shared_trials?shared_warps:block_threads/32)
+                 <<" shared_bytes="<<sh_bytes<<" scratch_bytes="<<scratch_bytes
+                 <<" shared_per_sm="<<prop.sharedMemPerMultiprocessor
+                 <<" shared_max_block="<<prop.sharedMemPerBlockOptin
+                 <<" SMs="<<prop.multiProcessorCount
+                 <<" regs/thread="<<attributes.numRegs<<" local_bytes/thread="<<attributes.localSizeBytes
+                 <<" active_blocks/SM="<<active_blocks<<"\n";
     }
     while(!s.stop.load(std::memory_order_relaxed)) {
         if(pause_requested(o)) { s.stop.store(true); break; }
@@ -775,10 +928,28 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
         const bool committed=process_batch(o,id,static_cast<uint32_t>(micro),s,
           [&](uint32_t n,uint32_t offset,const AesKey& key,std::vector<uint32_t>& failures) {
             CK(cudaMemset(d_count,0,sizeof(uint32_t)));
-            const unsigned blocks=(n+THREADS-1)/THREADS;
+            const unsigned blocks=(n+block_threads-1)/block_threads;
             const uint64_t range_mask=(1ULL<<o.ell_i)-1ULL;
             const uint32_t input_mode=(o.input_mode=="sequential")?0u:1u;
-            if(o.mode=="bgh25") {
+            if(use_shared_trials && o.mode=="bgh25") {
+                const unsigned trial_blocks=(n+shared_warps-1)/shared_warps;
+                cuckoo_shared<true><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
+                    p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
+                    input_mode,key,shared_warps,d_count,d_offsets);
+            } else if(use_shared_trials) {
+                const unsigned trial_blocks=(n+shared_warps-1)/shared_warps;
+                cuckoo_shared<false><<<trial_blocks,shared_warps*32,sh_bytes>>>(n,offset,o.pnum,
+                    p.buckets,p.kick,p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,
+                    input_mode,key,shared_warps,d_count,d_offsets);
+            } else if(cached && o.mode=="bgh25") {
+                cuckoo_cached<true><<<blocks,block_threads,sh_bytes>>>(n,offset,o.pnum,p.buckets,p.kick,
+                    p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,input_mode,key,pitch,
+                    d_bins,d_rounds,d_count,d_offsets);
+            } else if(cached) {
+                cuckoo_cached<false><<<blocks,block_threads,sh_bytes>>>(n,offset,o.pnum,p.buckets,p.kick,
+                    p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,input_mode,key,pitch,
+                    d_bins,d_rounds,d_count,d_offsets);
+            } else if(o.mode=="bgh25") {
                 cuckoo_trials<true><<<blocks,THREADS,sh_bytes>>>(n,offset,o.pnum,p.buckets,p.kick,
                      p.bucket_size,p.domain,p.half_bits,p.mask,range_mask,input_mode,
                      key,use_shared,d_bins,d_count,d_offsets);
@@ -800,31 +971,27 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
           });
         if(!committed) break;
     }
-    bins_memory.free_checked(); count_memory.free_checked(); offsets_memory.free_checked();
+    bins_memory.free_checked(); rounds_memory.free_checked(); count_memory.free_checked(); offsets_memory.free_checked();
 }
 #endif // CUCKOO_HOST_TEST
 static void print_progress(const Options& o,const Counters& s,
                            std::chrono::steady_clock::time_point start) {
-    uint64_t prev=s.completed.load(); auto prev_time=start;
-    double smooth=0;
+    const uint64_t initial=s.completed.load();
     const uint64_t total=1ULL<<o.et;
     while(s.active.load()>0) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         const auto now=std::chrono::steady_clock::now();
         const auto done=s.completed.load(),fail=s.failed.load();
-        double dt=std::chrono::duration<double>(now-prev_time).count();
-        double rate=(done-prev)/std::max(dt,1e-6);
-        smooth=(smooth==0?rate:0.75*smooth+0.25*rate);
         double elapsed=std::chrono::duration<double>(now-start).count();
-        double eta=smooth>0?(double)(total-done)/smooth:-1.0;
+        const double average=(done-initial)/std::max(elapsed,1e-6);
+        double eta=average>0?(double)(total-done)/average:-1.0;
         const unsigned filled=(unsigned)std::min<uint64_t>(30,(done*30)/total);
         std::cerr<<'\r'<<'['<<std::string(filled,'#')<<std::string(30-filled,'-')<<"] "
                  <<std::fixed<<std::setprecision(2)
                  <<100.0*done/total<<"% | "<<done<<"/"<<total
-                 <<" | Fail "<<fail<<" | "<<std::setprecision(0)<<smooth<<" exp/s"
+                 <<" | Fail "<<fail<<" | "<<std::setprecision(0)<<average<<" avg exp/s"
                  <<" | elapsed "<<std::setprecision(1)<<elapsed<<"s"
                  <<" | ETA "<<(eta>=0?std::to_string((uint64_t)eta)+"s":"--")<<"     "<<std::flush;
-        prev=done;prev_time=now;
     }
     std::cerr<<'\n';
 }
@@ -861,6 +1028,7 @@ int main(int argc,char** argv) {
         // Re-uploading them concurrently on a shared GPU could race with readers.
         for(int gpu=0;gpu<std::min(gpus,o.workers);++gpu) {
             CK(cudaSetDevice(gpu)); upload_aes_tables(); aes_self_test();
+            if(round_cache_enabled(o,p)) cached_aes_self_test();
         }
         std::mutex print_mutex;
         std::vector<std::thread> threads;

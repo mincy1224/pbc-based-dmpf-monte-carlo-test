@@ -66,13 +66,15 @@ def main():
     total = 1 << args.et
     cases = []
     if not args.cpu_only:
-        cases += [('gpu_256m', 'cuda', 1, 16384, 256),
-                  ('gpu_micro32768', 'cuda', 1, 32768, 1024),
-                  ('gpu_micro65536', 'cuda', 1, 65536, 2048)]
+        cases += [('gpu_256m', 'cuda', 1, 16384, 256, 'global'),
+                  ('gpu_micro32768', 'cuda', 1, 32768, 1024, 'global'),
+                  ('gpu_micro65536', 'cuda', 1, 65536, 2048, 'global'),
+                  ('gpu_shared', 'cuda', 1, 65536, 64, 'shared')]
         if args.et > args.bt:
-            cases.append(('gpu_workers2', 'cuda', 2, 32768, 1024))
+            cases.append(('gpu_workers2', 'cuda', 2, 32768, 1024, 'global'))
     if not args.gpu_only:
-        cases += [(f'cpu_w{n}', 'cpu-aesni', n, 64, 256) for n in dict.fromkeys(args.cpu_workers)]
+        cases += [(f'cpu_w{n}', 'cpu-aesni', n, 64, 256, 'global')
+                  for n in dict.fromkeys(args.cpu_workers)]
     report = dict(status='running', settings=vars(args).copy(), platform=platform.platform(),
                   logical_cpus=os.cpu_count(), records=[], aggregates=[])
     report['settings'] = {key: str(value) if isinstance(value, Path) else value for key, value in report['settings'].items()}
@@ -98,17 +100,20 @@ def main():
     try:
         for mode in args.modes:
             reference = None
-            for name, backend, workers, micro, scratch in cases:
+            for name, backend, workers, micro, scratch, layout in cases:
                 rates, durations = [], []
                 repeats = args.gpu_repeats if backend == 'cuda' else args.cpu_repeats
                 for repeat in range(1, repeats + 1):
                     directory = root / f'{mode}_{name}_r{repeat}'
                     exe = args.gpu_exe if backend == 'cuda' else args.cpu_exe
+                    cache = 'off' if name == 'gpu_256m' else 'on'
                     command = [str(exe), '--mode', mode, '--et', str(args.et), '--bt', str(args.bt),
                                '--pnum', str(args.pnum), '--ell-i', str(args.ell_i),
                                '--seed', str(args.seed), '--input-mode', args.input_mode,
                                '--workers', str(workers), '--micro', str(micro),
-                               '--scratch-mib', str(scratch), '--stop-after', str(total), '--out', str(directory)]
+                               '--scratch-mib', str(scratch), '--prp-cache', cache,
+                               '--table-layout', layout,
+                               '--stop-after', str(total), '--out', str(directory)]
                     print(f'RUN {mode} {name} repeat={repeat}/{repeats}, trials={total}', flush=True)
                     started = time.monotonic()
                     with directory.with_suffix('.log').open('w', encoding='utf-8') as log:
@@ -120,7 +125,8 @@ def main():
                     expected = dict(status='complete', completed=total, planned=total, backend=backend,
                                     ET=args.et, BT=args.bt, PNUM_T=args.pnum, ELL_I=args.ell_i,
                                     seed_decimal=str(args.seed), mode=mode, input_mode=args.input_mode,
-                                    workers=workers, seed_scheme='aes-batch-v1',
+                                    workers=workers, seed_scheme='aes-batch-v1', prp_cache_enabled=cache == 'on',
+                                    table_layout_requested=layout,
                                     completed_batches=1 << (args.et - args.bt), pending_batches=0)
                     for key, value in expected.items():
                         require(summary.get(key) == value, f'{name}: unexpected {key}: {summary.get(key)!r}')
@@ -133,6 +139,7 @@ def main():
                     require(events == reference, f'{name}: failure positions differ from other configurations')
                     rates.append(total / elapsed); durations.append(elapsed)
                     row = dict(mode=mode, case=name, repeat=repeat, backend=backend, workers=workers,
+                               table_layout=layout,
                                micro=micro, scratch_mib=scratch, trials=total, failed=len(events),
                                work_seconds=elapsed, work_trials_per_second=total / elapsed,
                                elapsed_seconds=summary['elapsed_seconds'], process_wall_seconds=wall,

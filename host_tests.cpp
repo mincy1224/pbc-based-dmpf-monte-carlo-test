@@ -152,6 +152,9 @@ static void check_locks_and_parameters(const fs::path& root) {
     { RunLock lock(o.out); }
     must_throw([]{parse_u64("-1");},"negative unsigned argument accepted");
     must_throw([]{parse_u32("4294967296");},"overflowing argument accepted");
+    { char name[]="bench",flag[]="--scratch-mib",value[]="2048";
+      char* argv[]={name,flag,value};require(parse(3,argv).scratch_mib==2048,"GPU budget argument ignored");
+      char zero[]="0";argv[2]=zero;must_throw([&]{parse(3,argv);},"zero GPU budget accepted"); }
     auto p=parameters(o); require(p.buckets==23,"DRRT18 parameter derivation unexpectedly changed");
     o.mode="bgh25"; require(parameters(o).buckets==32,"BGH25 parameter derivation unexpectedly changed");
     std::cout<<"PASS directory lock release, argument bounds, and parameter compatibility\n";

@@ -6,3 +6,9 @@ __pycache__/
 *.ilk
 *.pdb
 *.bin
+/cpu_bench
+/cuckoo_bench
+/cuckoo_mem16
+/cuckoo_mem16.cu
+/tune_*/
+/cpu_E*/

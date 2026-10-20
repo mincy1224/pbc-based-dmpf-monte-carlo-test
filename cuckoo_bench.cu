@@ -391,6 +391,8 @@ struct Options {
     uint64_t seed=1, stop_after=1ULL<<20;
     std::string mode="drrt18", out="cuckoo_results", input_mode="sequential";
     int workers=0;
+    uint32_t scratch_mib=256;
+    std::string backend="cuda";
     bool force_global=false, status_only=false;
 };
 static uint64_t parse_u64(const std::string& s) {
@@ -412,7 +414,7 @@ static Options parse(int argc,char** argv) {
             std::cout<<"Usage: ./cuckoo_bench --mode bgh25|drrt18 --et 40 --bt 20 "
                 "--pnum 16 --seed 123 --workers 1 --micro 131072 "
                 "--out results [--input-mode sequential|affine] "
-                "[--stop-after 1048576] [--global-table] [--status]\n";
+                "[--scratch-mib 256] [--stop-after 1048576] [--global-table] [--status]\n";
             std::exit(0);
         }
         if(a=="--global-table") { o.force_global=true; continue; }
@@ -424,6 +426,7 @@ static Options parse(int argc,char** argv) {
         else if(a=="--pnum") o.pnum=parse_u32(v);
         else if(a=="--ell-i") o.ell_i=parse_u32(v);
         else if(a=="--micro") o.micro=parse_u32(v);
+        else if(a=="--scratch-mib") o.scratch_mib=parse_u32(v);
         else if(a=="--seed") o.seed=parse_u64(v);
         else if(a=="--workers") { auto n=parse_u64(v); if(n>256) throw std::runtime_error("workers exceeds 256"); o.workers=static_cast<int>(n); }
         else if(a=="--stop-after") o.stop_after=parse_u64(v);
@@ -433,7 +436,7 @@ static Options parse(int argc,char** argv) {
         else throw std::runtime_error("Unknown option "+a);
     }
     if (o.et>40 || o.bt>30 || o.bt>o.et || o.et==0 || o.bt==0 ||
-        o.pnum<3 || o.pnum>65534 || o.micro==0 || o.ell_i>61 ||
+        o.pnum<3 || o.pnum>65534 || o.micro==0 || o.scratch_mib==0 || o.ell_i>61 ||
         (o.ell_i<16 && (1ULL<<o.ell_i)<o.pnum) ||
         (o.mode!="bgh25" && o.mode!="drrt18") ||
         (o.input_mode!="sequential" && o.input_mode!="affine"))
@@ -562,7 +565,17 @@ struct Counters {
     std::atomic<bool> stop{false}, abort_inflight{false};
     std::atomic<int> active{0};
     std::atomic<uint64_t> next_batch{0};
+    std::atomic<int64_t> finished_ns{0};
 };
+static int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void mark_finished(Counters& s) {
+    const auto now=steady_ns();
+    auto previous=s.finished_ns.load();
+    while(previous<now && !s.finished_ns.compare_exchange_weak(previous,now)) {}
+}
 static std::vector<uint8_t> resume(const Options& o,const Params& p, Counters& s) {
     const uint64_t total_batches=1ULL<<(o.et-o.bt);
     if(total_batches>(1ULL<<28))
@@ -660,13 +673,16 @@ static bool process_batch(const Options& o,uint64_t id,uint32_t micro,Counters& 
     return true;
 }
 static void final_outputs(const Options& o,const Params& p,
-                          const Counters& s,double seconds,const std::string& status="complete") {
+                          const Counters& s,double seconds,const std::string& status="complete",
+                          double work_seconds=0) {
     auto completed=s.completed.load(), fails=s.failed.load(), batches=s.batches.load();
     {
         std::ofstream out; out.exceptions(std::ios::failbit|std::ios::badbit);
         out.open(o.out+"/summary.json",std::ios::trunc);
         out<<"{\n  \"status\": \""<<status<<"\",\n  \"seed_scheme\": \"aes-batch-v1\",\n"
            <<"  \"mode\": \""<<o.mode<<"\",\n  \"algorithm\": \"prp-cuckoo-aes-feistel-port\",\n"
+           <<"  \"backend\": \""<<o.backend<<"\",\n  \"workers\": "<<o.workers<<",\n"
+           <<"  \"micro_requested\": "<<o.micro<<",\n  \"scratch_mib\": "<<o.scratch_mib<<",\n"
            <<"  \"input_mode\": \""<<o.input_mode<<"\",\n"
            <<"  \"seed\": "<<o.seed<<",\n  \"ET\": "<<o.et<<",\n  \"BT\": "<<o.bt<<",\n"
            <<"  \"seed_decimal\": \""<<o.seed<<"\",\n  \"batch_size\": "<<(1ULL<<o.bt)<<",\n"
@@ -677,7 +693,8 @@ static void final_outputs(const Options& o,const Params& p,
            <<",\n  \"failed\": "<<fails<<",\n  \"completed_batches\": "<<batches
            <<",\n  \"pending_batches\": "<<((1ULL<<(o.et-o.bt))-batches)
            <<",\n  \"failed_ratio\": "<<std::setprecision(17)<<(completed?(double)fails/completed:0.0)
-           <<",\n  \"elapsed_seconds\": "<<seconds<<",\n  \"threshold_exceeded\": "
+           <<",\n  \"elapsed_seconds\": "<<seconds
+           <<",\n  \"work_elapsed_seconds\": "<<work_seconds<<",\n  \"threshold_exceeded\": "
            <<(fails>o.stop_after?"true":"false")<<"\n}\n";
         out.flush(); out.close();
     }
@@ -732,8 +749,8 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
             CK(cudaFuncSetAttribute(cuckoo_trials<false>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sh_bytes));
         }
     }
-    // Limit temporary GPU memory to roughly 256 MiB per worker.
-    const uint64_t limit_bytes=256ULL<<20;
+    // Table-space budget per worker, independent of experiment seeds/journals.
+    const uint64_t limit_bytes=uint64_t(o.scratch_mib)<<20;
     uint64_t micro=o.micro;
     if(!use_shared) micro=std::min(micro,limit_bytes/(p.buckets*sizeof(uint32_t)));
     micro=std::min(micro,batch_size);
@@ -785,6 +802,7 @@ static void gpu_worker(int worker,int gpu,const Options& o,const Params& p,
     }
     bins_memory.free_checked(); count_memory.free_checked(); offsets_memory.free_checked();
 }
+#endif // CUCKOO_HOST_TEST
 static void print_progress(const Options& o,const Counters& s,
                            std::chrono::steady_clock::time_point start) {
     uint64_t prev=s.completed.load(); auto prev_time=start;
@@ -810,6 +828,7 @@ static void print_progress(const Options& o,const Counters& s,
     }
     std::cerr<<'\n';
 }
+#ifndef CUCKOO_HOST_TEST
 int main(int argc,char** argv) {
     try {
         auto o=parse(argc,argv);
@@ -847,6 +866,7 @@ int main(int argc,char** argv) {
         std::vector<std::thread> threads;
         std::vector<std::exception_ptr> errors(o.workers);
         std::exception_ptr launch_error;
+        const auto work_start=steady_ns();
         if(s.failed.load()<=o.stop_after) {
             for(int g=0;g<o.workers;++g) {
                 s.active.fetch_add(1);
@@ -857,7 +877,7 @@ int main(int argc,char** argv) {
                             errors[g]=std::current_exception();
                             s.abort_inflight.store(true); s.stop.store(true);
                         }
-                        s.active.fetch_sub(1);
+                        mark_finished(s); s.active.fetch_sub(1);
                     });
                 } catch (...) {
                     s.active.fetch_sub(1);
@@ -875,7 +895,8 @@ int main(int argc,char** argv) {
         const std::string status=error?"error":recovered.completed.load()==planned?"complete":
                                   pause_requested(o)?"paused":"threshold";
         const auto elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
-        final_outputs(o,p,recovered,elapsed,status);
+        const auto work_seconds=std::max<int64_t>(0,s.finished_ns.load()-work_start)*1e-9;
+        final_outputs(o,p,recovered,elapsed,status,work_seconds);
         std::cout<<"RESULT status="<<status<<" completed="<<recovered.completed<<" failed="<<recovered.failed
                  <<" elapsed_s="<<elapsed<<"\n";
         if(pause_requested(o)) std::cout<<"Paused: unfinished batches were not counted. Restart the same command to resume. "
